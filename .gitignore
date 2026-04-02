@@ -19,6 +19,7 @@ Results/
 Results
 Model/
 Model
+data/
 
 # Config Local (specific to the platform etc.) are not shared
 **/local_*
