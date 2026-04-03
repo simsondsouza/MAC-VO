@@ -5,12 +5,20 @@ Loop Closure Detectors for MAC-SLAM
 Two detector implementations:
 
 1. **MixVPRLoopDetector**  (recommended)
-   Self-contained MixVPR (WACV 2023) re-implementation with pretrained
-   GSV-Cities weights.  ResNet-50 backbone + Feature-Mixer aggregation ->
-   4096-d descriptor.  94.6% R@1 on Pitts250k-test.
+   Self-contained MixVPR (WACV 2023) re-implementation that mirrors the
+   official repo (https://github.com/amaralibey/MixVPR) so that pretrained
+   GSV-Cities checkpoints load directly.
+
+   Architecture:  ResNet-50 backbone (layer3) + Feature-Mixer aggregation
+   → 4096-d descriptor.  94.6% R@1 on Pitts250k-test.
+
+   **Critical**: the attribute names (``encoder``, ``aggregator.mix``) MUST
+   match the official checkpoint keys exactly.  Earlier versions used
+   ``backbone`` / ``mix_blocks`` which caused silent weight-loading failure
+   under ``strict=False``.
 
 2. **NetVLADLoopDetector**  (lightweight fallback)
-   GeM-pooled ResNet-18 -- untrained for VPR, only useful for quick tests.
+   GeM-pooled ResNet-18 — untrained for VPR, only useful for quick tests.
 
 Geometric Verification
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -38,15 +46,29 @@ from .Interface import ILoopClosureDetector, LoopClosureResult
 
 
 # ===================================================================
-#  MixVPR Architecture  (self-contained, no external repo needed)
+#  MixVPR Architecture
+#
+#  Mirrors the official repo so that pretrained checkpoints load via
+#  ``load_state_dict``.  Key naming contract:
+#
+#    VPRModel
+#    ├── encoder       (nn.Sequential of ResNet children)
+#    │   ├── 0         conv1
+#    │   ├── 1         bn1
+#    │   ├── 2         relu / act1
+#    │   ├── 3         maxpool
+#    │   ├── 4         layer1
+#    │   ├── 5         layer2
+#    │   └── 6         layer3        ← cropped here (layer4 removed)
+#    └── aggregator    (MixVPR)
+#        ├── mix       nn.Sequential of FeatureMixerLayer
+#        ├── channel_proj  nn.Linear
+#        └── row_proj      nn.Linear
 # ===================================================================
 
-class FeatureMixerLayer(nn.Module):
-    """Single Feature-Mixer block from the MixVPR paper.
 
-    Operates on (B, C, N) where C = channels, N = H*W spatial tokens.
-    Mixes information *across spatial positions* via an MLP with skip.
-    """
+class FeatureMixerLayer(nn.Module):
+    """Single Feature-Mixer block (unchanged from official repo)."""
 
     def __init__(self, in_dim: int, mlp_ratio: int = 1):
         super().__init__()
@@ -61,51 +83,81 @@ class FeatureMixerLayer(nn.Module):
         return x + self.mix(x)
 
 
-class MixVPRAggregator(nn.Module):
-    """MixVPR aggregation head.
+class MixVPR(nn.Module):
+    """MixVPR aggregation head — matches official repo class name and
+    attribute names so that checkpoint keys align.
 
-    Takes feature maps from an intermediate backbone layer, flattens the
-    spatial dims, applies L stacked Feature-Mixer blocks, then projects
-    to a compact descriptor.
+    Official key pattern::
+
+        aggregator.mix.{i}.mix.{j}.weight
+        aggregator.channel_proj.weight
+        aggregator.row_proj.weight
 
     Args:
         in_channels:  Feature-map channels (1024 for ResNet50-layer3).
-        in_h, in_w:   Spatial dims of the feature map (20x20 for 320 input).
-        out_channels: Channels after row-wise projection.
+        in_h, in_w:   Spatial dims of the feature map (20×20 for 320 input).
+        out_channels: Channels after channel projection.
         mix_depth:    Number of Feature-Mixer blocks (L=4 in paper).
         mlp_ratio:    MLP expansion ratio inside each mixer block.
-        out_rows:     Number of output rows (desc_dim = out_rows * out_channels).
+        out_rows:     Number of output rows (desc_dim = out_rows × out_channels).
     """
 
     def __init__(
         self,
-        in_channels: int = 1024, in_h: int = 20, in_w: int = 20,
-        out_channels: int = 1024, mix_depth: int = 4,
-        mlp_ratio: int = 1, out_rows: int = 4,
+        in_channels: int = 1024,
+        in_h: int = 20,
+        in_w: int = 20,
+        out_channels: int = 1024,
+        mix_depth: int = 4,
+        mlp_ratio: int = 1,
+        out_rows: int = 4,
     ):
         super().__init__()
+        self.in_h = in_h
+        self.in_w = in_w
+        self.in_channels = in_channels
         hw = in_h * in_w
-        self.mix_blocks = nn.ModuleList(
-            [FeatureMixerLayer(hw, mlp_ratio) for _ in range(mix_depth)])
+
+        # MUST be nn.Sequential named "mix" — not ModuleList, not "mix_blocks"
+        self.mix = nn.Sequential(
+            *[FeatureMixerLayer(hw, mlp_ratio=mlp_ratio)
+              for _ in range(mix_depth)]
+        )
         self.channel_proj = nn.Linear(in_channels, out_channels)
         self.row_proj = nn.Linear(hw, out_rows)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x.flatten(2)                                 # (B, C, H*W)
-        for mix in self.mix_blocks:
-            x = mix(x)
-        x = self.channel_proj(x.permute(0, 2, 1))        # (B, H*W, out_ch)
-        x = x.permute(0, 2, 1)                           # (B, out_ch, H*W)
-        x = self.row_proj(x)                              # (B, out_ch, out_rows)
-        x = x.flatten(1)                                  # (B, desc_dim)
-        return F.normalize(x, p=2, dim=-1)
+        x = x.flatten(2)                          # (B, C, H*W)
+        x = self.mix(x)                           # Sequential pass
+        x = x.permute(0, 2, 1)                    # (B, H*W, C)
+        x = self.channel_proj(x)                   # (B, H*W, out_ch)
+        x = x.permute(0, 2, 1)                    # (B, out_ch, H*W)
+        x = self.row_proj(x)                       # (B, out_ch, out_rows)
+        return F.normalize(x.flatten(1), p=2, dim=-1)
 
 
 class VPRModel(nn.Module):
-    """Complete VPR model:  backbone + aggregator.
+    """Complete VPR model:  encoder (backbone) + aggregator.
 
-    Mirrors ``main.py`` from the official MixVPR repo so that pretrained
-    checkpoints load directly via ``load_state_dict``.
+    Attribute names match the official MixVPR ``VPRModel`` so that
+    checkpoint state-dicts load without key remapping.
+
+    Official checkpoint layout::
+
+        state_dict = {
+            "state_dict": {
+                "encoder.0.weight":   ...,   # conv1
+                "encoder.1.weight":   ...,   # bn1
+                ...
+                "encoder.6.0.conv1.weight": ...,   # layer3[0]
+                ...
+                "aggregator.mix.0.mix.0.weight": ...,  # 1st mixer LayerNorm
+                "aggregator.mix.0.mix.1.weight": ...,  # 1st mixer Linear
+                ...
+                "aggregator.channel_proj.weight": ...,
+                "aggregator.row_proj.weight": ...,
+            }
+        }
     """
 
     def __init__(
@@ -125,36 +177,47 @@ class VPRModel(nn.Module):
                 in_channels=1024, in_h=20, in_w=20,
                 out_channels=1024, mix_depth=4, mlp_ratio=1, out_rows=4)
 
+        # ── Build backbone ──────────────────────────────────────────
         import torchvision.models as models
+
         weights_map = {
             "resnet18": models.ResNet18_Weights.DEFAULT,
             "resnet34": models.ResNet34_Weights.DEFAULT,
             "resnet50": models.ResNet50_Weights.DEFAULT,
         }
-        builder = {"resnet18": models.resnet18,
-                    "resnet34": models.resnet34,
-                    "resnet50": models.resnet50}
+        builder = {
+            "resnet18": models.resnet18,
+            "resnet34": models.resnet34,
+            "resnet50": models.resnet50,
+        }
         net = builder[backbone_arch](
             weights=weights_map[backbone_arch] if pretrained else None)
 
+        # Remove avgpool + fc, then crop requested layers
         layers = list(net.children())[:-2]
-        # Crop: layer4 is child-index 7 -> crop_idx=4 means remove child[7]
         for ci in sorted(layers_to_crop or [], reverse=True):
+            # layer4 is children()[7], crop_idx=4 → remove from index 7
             idx = ci + 3
             if idx < len(layers):
                 layers = layers[:idx]
-        self.backbone = nn.Sequential(*layers)
 
-        for i, child in enumerate(self.backbone.children()):
+        # MUST be named "encoder" to match official checkpoint keys
+        self.encoder = nn.Sequential(*layers)
+
+        # Freeze early layers
+        for i, child in enumerate(self.encoder.children()):
             if i < layers_to_freeze + 3:
                 for p in child.parameters():
                     p.requires_grad = False
 
-        self.aggregator = MixVPRAggregator(**agg_config)
+        # ── Build aggregator ────────────────────────────────────────
+        # MUST be named "aggregator"
+        self.aggregator = MixVPR(**agg_config)
 
-    @torch.inference_mode()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.aggregator(self.backbone(x))
+        x = self.encoder(x)
+        x = self.aggregator(x)
+        return x
 
 
 # ===================================================================
@@ -162,11 +225,7 @@ class VPRModel(nn.Module):
 # ===================================================================
 
 class GeometricVerifier:
-    """ORB features + Essential Matrix RANSAC for LC verification.
-
-    Replaces the old "trust the VPR score" approach with actual
-    geometric consistency checking.
-    """
+    """ORB features + Essential Matrix RANSAC for LC verification."""
 
     def __init__(
         self,
@@ -187,7 +246,8 @@ class GeometricVerifier:
     def _to_gray(image: torch.Tensor) -> np.ndarray:
         img = image.squeeze(0).permute(1, 2, 0).cpu().numpy()
         if img.shape[2] == 3:
-            return cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+            return cv2.cvtColor(
+                (img * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
         return (img * 255).astype(np.uint8).squeeze(-1)
 
     def verify(
@@ -196,14 +256,13 @@ class GeometricVerifier:
         img_m: torch.Tensor,
         K: np.ndarray,
     ) -> tuple[bool, float, Optional[np.ndarray]]:
-        """
-        Returns (accepted, inlier_ratio, T_4x4_or_None).
-        """
+        """Returns (accepted, inlier_ratio, T_4x4_or_None)."""
         gq, gm = self._to_gray(img_q), self._to_gray(img_m)
         kp_q, des_q = self.orb.detectAndCompute(gq, None)
         kp_m, des_m = self.orb.detectAndCompute(gm, None)
 
-        if des_q is None or des_m is None or len(kp_q) < 10 or len(kp_m) < 10:
+        if (des_q is None or des_m is None
+                or len(kp_q) < 10 or len(kp_m) < 10):
             return False, 0.0, None
 
         raw = self.matcher.knnMatch(des_q, des_m, k=2)
@@ -243,6 +302,12 @@ class MixVPRLoopDetector(ILoopClosureDetector):
     Loop closure detector using pretrained MixVPR descriptors +
     geometric verification via ORB + Essential Matrix RANSAC.
 
+    Downloads / expects the official checkpoint::
+
+        resnet50_MixVPR_4096_channels(1024)_rows(4).ckpt
+
+    from https://github.com/amaralibey/MixVPR/releases
+
     Config (required):
         device, threshold, top_k, min_gap
     Config (optional):
@@ -259,13 +324,16 @@ class MixVPRLoopDetector(ILoopClosureDetector):
         self.top_k = getattr(config, "top_k", 3)
         self.default_min_gap = getattr(config, "min_gap", 50)
 
-        # Build MixVPR model
+        # Build MixVPR model (names match official repo)
         self.model = VPRModel(
-            backbone_arch="resnet50", pretrained=True,
-            layers_to_freeze=2, layers_to_crop=[4],
+            backbone_arch="resnet50",
+            pretrained=True,
+            layers_to_freeze=2,
+            layers_to_crop=[4],
             agg_config=dict(
                 in_channels=1024, in_h=20, in_w=20,
-                out_channels=1024, mix_depth=4, mlp_ratio=1, out_rows=4))
+                out_channels=1024, mix_depth=4, mlp_ratio=1, out_rows=4),
+        )
 
         wp = getattr(config, "weight_path", None)
         if wp is None:
@@ -279,40 +347,76 @@ class MixVPRLoopDetector(ILoopClosureDetector):
             match_ratio=getattr(config, "match_ratio", 0.75),
             ransac_threshold=getattr(config, "ransac_threshold", 1.0),
             min_inliers=getattr(config, "geometric_min_inliers", 30),
-            min_inlier_ratio=getattr(config, "geometric_min_inlier_ratio", 0.25))
+            min_inlier_ratio=getattr(
+                config, "geometric_min_inlier_ratio", 0.25),
+        )
 
         # Database
         self.kf_indices: list[int] = []
         self.descriptors: list[torch.Tensor] = []
         self.kf_images: dict[int, torch.Tensor] = {}
 
-        self._mean = torch.tensor([.485, .456, .406]).view(1, 3, 1, 1).to(self.device)
-        self._std  = torch.tensor([.229, .224, .225]).view(1, 3, 1, 1).to(self.device)
+        # ImageNet normalisation
+        self._mean = torch.tensor(
+            [0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
+        self._std = torch.tensor(
+            [0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
+
+    # ---------------------------------------------------------------
 
     def _load_weights(self, path: str) -> None:
+        """Load official MixVPR checkpoint.
+
+        The checkpoint is a PyTorch-Lightning file with top-level key
+        ``"state_dict"`` whose sub-keys start with ``encoder.*`` and
+        ``aggregator.*``.  Since our ``VPRModel`` uses the same attribute
+        names, they load directly.
+        """
         from Utility.PrettyPrint import Logger
+
         p = Path(path)
-        if p.exists():
-            try:
-                sd = torch.load(str(p), map_location="cpu", weights_only=False)
-                if "state_dict" in sd:
-                    sd = sd["state_dict"]
-                self.model.load_state_dict(sd, strict=False)
-                Logger.write("info", f"MixVPR: loaded weights from {p}")
-            except Exception as e:
-                Logger.write("warn", f"MixVPR: failed to load {p}: {e}")
-        else:
+        if not p.exists():
             Logger.write("warn",
-                f"MixVPR: weights not found at {p}. "
-                f"Download from the official MixVPR release: "
-                f"https://github.com/amaralibey/MixVPR#weights "
-                f"and place at {p}. Using ImageNet backbone only.")
+                f"MixVPR: weights not found at {p}.\n"
+                f"  Download from the official MixVPR release:\n"
+                f"    https://github.com/amaralibey/MixVPR/releases\n"
+                f"  and place at: {p}\n"
+                f"  Using ImageNet backbone only — VPR accuracy will be poor.")
+            return
+
+        try:
+            ckpt = torch.load(str(p), map_location="cpu", weights_only=False)
+
+            # Official checkpoints wrap in "state_dict" (Lightning convention)
+            sd = ckpt.get("state_dict", ckpt)
+
+            # Load and report
+            result = self.model.load_state_dict(sd, strict=False)
+
+            n_loaded = len(sd) - len(result.unexpected_keys)
+            n_model = len(list(self.model.state_dict().keys()))
+            Logger.write("info",
+                f"MixVPR: loaded {n_loaded}/{n_model} parameters from {p}")
+
+            if result.missing_keys:
+                Logger.write("debug",
+                    f"MixVPR: missing keys: {result.missing_keys[:5]}...")
+            if result.unexpected_keys:
+                Logger.write("debug",
+                    f"MixVPR: unexpected keys: {result.unexpected_keys[:5]}...")
+
+        except Exception as e:
+            Logger.write("warn", f"MixVPR: failed to load {p}: {e}")
+
+    # ---------------------------------------------------------------
 
     @torch.inference_mode()
     def _encode(self, image: torch.Tensor) -> torch.Tensor:
+        """Encode a single image → L2-normalised descriptor (1, 4096)."""
         x = image.to(self.device).float()
         x = (x - self._mean) / self._std
-        x = F.interpolate(x, size=(320, 320), mode="bilinear", align_corners=False)
+        x = F.interpolate(
+            x, size=(320, 320), mode="bilinear", align_corners=False)
         return self.model(x).cpu()
 
     def add_keyframe(self, kf_idx: int, image: torch.Tensor) -> None:
@@ -320,7 +424,9 @@ class MixVPRLoopDetector(ILoopClosureDetector):
         self.descriptors.append(self._encode(image))
         self.kf_images[kf_idx] = image.cpu().float()
 
-    def query(self, kf_idx: int, min_gap: int | None = None) -> list[tuple[int, float]]:
+    def query(
+        self, kf_idx: int, min_gap: int | None = None
+    ) -> list[tuple[int, float]]:
         if min_gap is None:
             min_gap = self.default_min_gap
         if len(self.descriptors) < 2:
@@ -331,10 +437,12 @@ class MixVPRLoopDetector(ILoopClosureDetector):
             return []
         qd = self.descriptors[qpos]
         sims = (torch.cat(self.descriptors, 0) @ qd.T).squeeze(-1)
-        cands = [(ki, s) for ki, s in zip(self.kf_indices, sims.tolist())
-                 if abs(ki - kf_idx) >= min_gap and s >= self.threshold]
+        cands = [
+            (ki, s) for ki, s in zip(self.kf_indices, sims.tolist())
+            if abs(ki - kf_idx) >= min_gap and s >= self.threshold
+        ]
         cands.sort(key=lambda x: -x[1])
-        return cands[:self.top_k]
+        return cands[: self.top_k]
 
     def geometric_verify(
         self, query_kf_idx: int, match_kf_idx: int, K: np.ndarray,
@@ -370,14 +478,19 @@ class GeM(nn.Module):
         super().__init__()
         self.p = nn.Parameter(torch.tensor(p))
         self.eps = eps
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.adaptive_avg_pool2d(
-            x.clamp(min=self.eps).pow(self.p), 1
-        ).pow(1.0 / self.p).flatten(1)
+        return (
+            F.adaptive_avg_pool2d(
+                x.clamp(min=self.eps).pow(self.p), 1)
+            .pow(1.0 / self.p)
+            .flatten(1)
+        )
 
 
-class NetVLADLoopDetector(ILoopClosureDetector):
+class NetVLADLoopDetectora(ILoopClosureDetector):
     """Lightweight fallback using GeM-pooled ResNet-18 (not VPR-trained)."""
+
     def __init__(self, config: SimpleNamespace):
         super().__init__(config)
         self.device = config.device
@@ -385,56 +498,71 @@ class NetVLADLoopDetector(ILoopClosureDetector):
         self.top_k = getattr(config, "top_k", 3)
         self.default_min_gap = getattr(config, "min_gap", 30)
         dim = getattr(config, "descriptor_dim", 512)
+
         import torchvision.models as models
         net = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         enc = nn.Sequential(*list(net.children())[:-2])
         pool = GeM()
         with torch.no_grad():
-            fd = pool(enc(torch.zeros(1,3,224,224))).shape[1]
+            fd = pool(enc(torch.zeros(1, 3, 224, 224))).shape[1]
         proj = nn.Linear(fd, dim) if fd != dim else nn.Identity()
-        for p in enc.parameters(): p.requires_grad = False
+        for p in enc.parameters():
+            p.requires_grad = False
         enc.eval()
         self.enc = enc.to(self.device)
         self.pool = pool.to(self.device)
         self.proj = proj.to(self.device)
         self.kf_indices: list[int] = []
         self.descriptors: list[torch.Tensor] = []
-        self._mean = torch.tensor([.485,.456,.406]).view(1,3,1,1).to(self.device)
-        self._std  = torch.tensor([.229,.224,.225]).view(1,3,1,1).to(self.device)
+        self._mean = torch.tensor(
+            [0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
+        self._std = torch.tensor(
+            [0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
 
     @torch.inference_mode()
     def _encode(self, image: torch.Tensor) -> torch.Tensor:
         x = (image.to(self.device).float() - self._mean) / self._std
-        x = F.interpolate(x, size=(224,224), mode="bilinear", align_corners=False)
-        return F.normalize(self.proj(self.pool(self.enc(x))), p=2, dim=-1).cpu()
+        x = F.interpolate(
+            x, size=(224, 224), mode="bilinear", align_corners=False)
+        return F.normalize(
+            self.proj(self.pool(self.enc(x))), p=2, dim=-1).cpu()
 
     def add_keyframe(self, kf_idx: int, image: torch.Tensor) -> None:
         self.kf_indices.append(kf_idx)
         self.descriptors.append(self._encode(image))
 
-    def query(self, kf_idx: int, min_gap: int|None = None) -> list[tuple[int,float]]:
-        if min_gap is None: min_gap = self.default_min_gap
-        if len(self.descriptors) < 2: return []
-        try: qpos = self.kf_indices.index(kf_idx)
-        except ValueError: return []
+    def query(
+        self, kf_idx: int, min_gap: int | None = None
+    ) -> list[tuple[int, float]]:
+        if min_gap is None:
+            min_gap = self.default_min_gap
+        if len(self.descriptors) < 2:
+            return []
+        try:
+            qpos = self.kf_indices.index(kf_idx)
+        except ValueError:
+            return []
         qd = self.descriptors[qpos]
-        sims = (torch.cat(self.descriptors,0) @ qd.T).squeeze(-1)
-        c = [(ki,s) for ki,s in zip(self.kf_indices,sims.tolist())
-             if abs(ki-kf_idx)>=min_gap and s>=self.threshold]
+        sims = (torch.cat(self.descriptors, 0) @ qd.T).squeeze(-1)
+        c = [
+            (ki, s) for ki, s in zip(self.kf_indices, sims.tolist())
+            if abs(ki - kf_idx) >= min_gap and s >= self.threshold
+        ]
         c.sort(key=lambda x: -x[1])
-        return c[:self.top_k]
+        return c[: self.top_k]
 
     def reset(self) -> None:
-        self.kf_indices.clear(); self.descriptors.clear()
+        self.kf_indices.clear()
+        self.descriptors.clear()
 
     @classmethod
-    def is_valid_config(cls, config: SimpleNamespace|None) -> None:
+    def is_valid_config(cls, config: SimpleNamespace | None) -> None:
         assert config is not None
         cls._enforce_config_spec(config, {
-            "device": lambda s: isinstance(s,str),
-            "backbone": lambda s: s in {"resnet18","resnet34","resnet50"},
-            "descriptor_dim": lambda d: isinstance(d,int) and d>0,
-            "threshold": lambda t: isinstance(t,float) and 0.<t<1.,
-            "top_k": lambda k: isinstance(k,int) and k>0,
-            "min_gap": lambda g: isinstance(g,int) and g>0,
+            "device":    lambda s: isinstance(s, str),
+            "backbone":  lambda s: s in {"resnet18", "resnet34", "resnet50"},
+            "descriptor_dim": lambda d: isinstance(d, int) and d > 0,
+            "threshold": lambda t: isinstance(t, float) and 0.0 < t < 1.0,
+            "top_k":     lambda k: isinstance(k, int) and k > 0,
+            "min_gap":   lambda g: isinstance(g, int) and g > 0,
         })

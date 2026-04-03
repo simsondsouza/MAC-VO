@@ -104,7 +104,7 @@ SLAM:
     args:
       device: *device
       # weight_path: ./Model/resnet50_MixVPR_4096_channels(1024)_rows(4).ckpt
-      threshold: 0.70           # cosine similarity threshold (MixVPR is better
+      threshold: 0.60           # cosine similarity threshold (MixVPR is better
                                 # calibrated; 0.70 is selective enough)
       top_k: 3                  # max candidates per query
       min_gap: 50               # frames; KITTI 00 loop ~ 1500-frame gap
@@ -123,7 +123,7 @@ SLAM:
     device: cpu                 # sparse graph → CPU is fine
 
   # Orchestrator behaviour
-  lc_min_gap: 50                # must match loop_closure.args.min_gap
+  lc_min_gap: 80                # must match loop_closure.args.min_gap
   lc_geometric_threshold: 0.25  # fallback for detectors without geometric_verify
   keyframe_freq: 5              # encode every N-th frame for VPR
   apply_correction: true        # propagate δT after global solve

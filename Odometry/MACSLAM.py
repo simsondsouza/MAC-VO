@@ -5,12 +5,14 @@ MAC-SLAM  –  MAC-VO + Global Pose Graph with Loop Closure
 ``MACSLAM`` is the *SystemManager* orchestrator described in the plan.
 It wraps the existing ``MACVO`` class (Tier 1 / local) and adds:
 
-* **Place recognition** — GeM-pooled ResNet descriptors encoded on every
-  global keyframe and queried against a brute-force cosine-similarity
-  database.
+* **Place recognition** — MixVPR (WACV 2023) pretrained descriptors encoded
+  on every global keyframe and queried against a brute-force cosine-similarity
+  database.  Falls back to GeM-pooled ResNet-18 (NetVLADLoopDetector) if
+  MixVPR weights are unavailable.
 * **Geometric verification** — candidate loop closures are verified using
-  relative-pose estimation (currently a heuristic; the plan foresees
-  re-using the MAC-VO ``Frontend`` for full feature-level verification).
+  ORB keypoints + Essential Matrix RANSAC via ``GeometricVerifier``.  The
+  recovered relative pose and inlier-ratio-scaled covariance are pushed
+  directly to the global pose graph.
 * **Global pose graph** — ``GlobalPGO_Optimizer`` runs asynchronously on a
   background thread with switchable constraints (§ Loop Closure in plan).
 * **Correction propagation** — after the global solve converges the
@@ -29,6 +31,7 @@ Threading model  (cf.  Fig. "Timing & Threading Model" in plan)
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import pypose as pp
 import typing as T
@@ -38,7 +41,7 @@ import Module
 from DataLoader import StereoFrame
 from Module.Map import VisualMap
 from Module.LoopClosure.Interface import ILoopClosureDetector, LoopClosureResult
-from Module.LoopClosure.NetVLAD import NetVLADLoopDetector
+from Module.LoopClosure.NetVLAD_MixVPR import MixVPRLoopDetector #, NetVLADLoopDetector
 from Module.Optimization.GlobalPGO.Optimizer import (
     GlobalPGO_Optimizer,
     SequentialEdge,
@@ -53,6 +56,12 @@ from .Interface import IOdometry
 
 T_SensorFrame = T.TypeVar("T_SensorFrame", bound=StereoFrame)
 
+# Detector class lookup for factory dispatch
+_LOOP_DETECTOR_REGISTRY: dict[str, type[ILoopClosureDetector]] = {
+    "MixVPRLoopDetector":  MixVPRLoopDetector,
+    # "NetVLADLoopDetector": NetVLADLoopDetector,
+}
+
 
 class MACSLAM(IOdometry[T_SensorFrame]):
     """
@@ -63,7 +72,9 @@ class MACSLAM(IOdometry[T_SensorFrame]):
     local_vo : MACVO
         Fully-initialised local MAC-VO pipeline.
     loop_detector : ILoopClosureDetector
-        VPR encoder + database for candidate retrieval.
+        VPR encoder + database for candidate retrieval.  Recommended:
+        ``MixVPRLoopDetector`` (4096-d MixVPR descriptors + ORB geometric
+        verification).  Lightweight fallback: ``NetVLADLoopDetector``.
     global_pgo : GlobalPGO_Optimizer
         Asynchronous global pose-graph backend.
     lc_min_gap : int
@@ -71,6 +82,8 @@ class MACSLAM(IOdometry[T_SensorFrame]):
         neighbouring frames).
     lc_geometric_threshold : float
         Minimum VPR similarity to proceed with geometric verification.
+        Only used by the heuristic fallback path; the ORB-based path in
+        ``MixVPRLoopDetector`` uses its own internal thresholds.
     keyframe_freq : int
         Every *keyframe_freq*-th frame is treated as a *global* keyframe
         (encoded for VPR and added to the global pose graph).  This is
@@ -104,6 +117,7 @@ class MACSLAM(IOdometry[T_SensorFrame]):
         self.global_kf_indices: list[int] = []
         self.frame_count: int = 0
         self.total_lc_detected: int = 0
+        self.total_lc_rejected: int = 0  # geometric verification failures
 
         # Install a hook so that after every local optimisation write-back
         # we automatically push the sequential edge to the global graph.
@@ -115,7 +129,12 @@ class MACSLAM(IOdometry[T_SensorFrame]):
 
     @classmethod
     def from_config(cls, cfg: SimpleNamespace) -> "MACSLAM":
-        """Build MAC-SLAM from a merged config namespace."""
+        """Build MAC-SLAM from a merged config namespace.
+
+        The default loop-closure detector is now ``MixVPRLoopDetector``.
+        Set ``cfg.SLAM.loop_closure.type = "NetVLADLoopDetector"`` to
+        fall back to the lightweight GeM-ResNet encoder.
+        """
 
         # ── Local MAC-VO ────────────────────────────────────────────────
         local_vo = MACVO[StereoFrame].from_config(cfg)
@@ -125,14 +144,20 @@ class MACSLAM(IOdometry[T_SensorFrame]):
         if slam_cfg is None:
             slam_cfg = SimpleNamespace(
                 loop_closure = SimpleNamespace(
-                    type = "NetVLADLoopDetector",
+                    type = "MixVPRLoopDetector",
                     args = SimpleNamespace(
                         device         = "cuda" if torch.cuda.is_available() else "cpu",
-                        backbone       = "resnet18",
-                        descriptor_dim = 512,
-                        threshold      = 0.85,
+                        threshold      = 0.70,
                         top_k          = 3,
-                        min_gap        = 30,
+                        min_gap        = 50,
+                        # MixVPR-specific
+                        weight_path    = None,   # auto-discovers Model/*.ckpt
+                        # Geometric verifier tunables
+                        orb_features              = 1000,
+                        match_ratio               = 0.75,
+                        ransac_threshold           = 1.0,
+                        geometric_min_inliers      = 30,
+                        geometric_min_inlier_ratio = 0.25,
                     ),
                 ),
                 global_pgo = SimpleNamespace(
@@ -141,15 +166,24 @@ class MACSLAM(IOdometry[T_SensorFrame]):
                     huber_delta    = 0.5,
                     device         = "cpu",
                 ),
-                lc_min_gap              = 30,
-                lc_geometric_threshold  = 0.80,
+                lc_min_gap              = 50,
+                lc_geometric_threshold  = 0.70,
                 keyframe_freq           = 5,
                 apply_correction        = True,
             )
 
-        # Loop-closure detector
-        lc_cfg = slam_cfg.loop_closure
-        loop_detector = NetVLADLoopDetector(lc_cfg.args)
+        # Loop-closure detector — dispatch by type string
+        lc_cfg       = slam_cfg.loop_closure
+        lc_type_name = getattr(lc_cfg, "type", "MixVPRLoopDetector")
+        lc_cls       = _LOOP_DETECTOR_REGISTRY.get(lc_type_name)
+        if lc_cls is None:
+            raise ValueError(
+                f"Unknown loop-closure detector '{lc_type_name}'. "
+                f"Available: {list(_LOOP_DETECTOR_REGISTRY)}")
+        loop_detector = lc_cls(lc_cfg.args)
+
+        Logger.write("info",
+            f"MACSLAM: using loop detector  {lc_type_name}")
 
         # Global PGO manager
         g = slam_cfg.global_pgo
@@ -164,8 +198,8 @@ class MACSLAM(IOdometry[T_SensorFrame]):
             local_vo               = local_vo,
             loop_detector          = loop_detector,
             global_pgo             = global_pgo,
-            lc_min_gap             = getattr(slam_cfg, "lc_min_gap", 30),
-            lc_geometric_threshold = getattr(slam_cfg, "lc_geometric_threshold", 0.80),
+            lc_min_gap             = getattr(slam_cfg, "lc_min_gap", 50),
+            lc_geometric_threshold = getattr(slam_cfg, "lc_geometric_threshold", 0.70),
             keyframe_freq          = getattr(slam_cfg, "keyframe_freq", 5),
             apply_correction       = getattr(slam_cfg, "apply_correction", True),
         )
@@ -219,7 +253,8 @@ class MACSLAM(IOdometry[T_SensorFrame]):
         """
         1. Encode the keyframe and add to VPR database.
         2. Query for candidates (cosine similarity).
-        3. Geometrically verify each candidate.
+        3. Geometrically verify each candidate (ORB + E-matrix RANSAC
+           when ``MixVPRLoopDetector`` is used, heuristic fallback otherwise).
         4. Push verified LC edges → ``GlobalPGO_Optimizer``.
         5. Trigger a background solve if new LCs were found.
         """
@@ -244,6 +279,7 @@ class MACSLAM(IOdometry[T_SensorFrame]):
                 lc = self._geometric_verify(
                     kf_idx, cand_kf_idx, frame, similarity)
                 if lc is None:
+                    self.total_lc_rejected += 1
                     continue
                 self.global_pgo.add_loop_closure_edge(LoopClosureEdge(
                     kf_idx_a      = lc.query_kf_idx,
@@ -254,6 +290,9 @@ class MACSLAM(IOdometry[T_SensorFrame]):
                 ))
                 self.total_lc_detected += 1
                 any_accepted = True
+                Logger.write("info",
+                    f"MACSLAM: LC accepted  {kf_idx} ↔ {cand_kf_idx}  "
+                    f"(confidence={lc.confidence:.3f})")
             except Exception as e:
                 Logger.write("warn",
                     f"MACSLAM: verification failed {kf_idx}→{cand_kf_idx}: {e}")
@@ -272,24 +311,61 @@ class MACSLAM(IOdometry[T_SensorFrame]):
         """
         Geometric verification of a loop-closure candidate.
 
-        Current implementation
+        Primary path  (MixVPRLoopDetector)
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        Uses ORB keypoints + Essential Matrix RANSAC (via the detector's
+        ``GeometricVerifier``) to check geometric consistency and recover
+        the relative pose.  The covariance is scaled by the inlier ratio:
+        more inliers → tighter covariance → stronger constraint in the
+        global pose graph.
+
+        Fallback path  (NetVLADLoopDetector / any detector without
+        ``geometric_verify``)
         ~~~~~~~~~~~~~~~~~~~~~~
-        Uses the *poses already in the map* to compute the relative
-        transform and assigns a heuristic covariance that grows with the
-        temporal gap.
-
-        Planned upgrade  (plan §IV-1)
-        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        Re-extract features from both keyframes via ``Frontend``, match them,
-        and run a PnP / ICP solve to get a *measurement-based* relative pose
-        with a proper Hessian-derived covariance.
+        Uses the poses already in the map to compute the relative transform
+        and assigns a heuristic covariance that grows with the temporal gap.
         """
-        if similarity < self.lc_geometric_threshold:
-            return None
-
         graph    = self.local_vo.graph
         n_frames = len(graph.frames)
         if query_kf_idx >= n_frames or match_kf_idx >= n_frames:
+            return None
+
+        # ── Primary: ORB + Essential Matrix RANSAC ──────────────────────
+        if hasattr(self.loop_detector, "geometric_verify"):
+            K_tensor = graph.frames.data["K"][query_kf_idx]   # (3, 3)
+            K_np = K_tensor.cpu().numpy().astype(np.float64)
+
+            accepted, inlier_ratio, T_4x4 = self.loop_detector.geometric_verify(
+                query_kf_idx, match_kf_idx, K_np)
+
+            if not accepted or T_4x4 is None:
+                Logger.write("debug",
+                    f"MACSLAM: geometric verification rejected "
+                    f"{query_kf_idx}→{match_kf_idx}  "
+                    f"(inlier_ratio={inlier_ratio:.3f})")
+                return None
+
+            # Convert 4×4 numpy SE(3) → pypose SE3
+            T_rel = pp.mat2SE3(
+                torch.from_numpy(T_4x4).unsqueeze(0).double())
+
+            # Covariance: tighter when more inliers agree
+            #   inlier_ratio ≈ 1.0  →  cov_scale ≈ 0.001  (strong)
+            #   inlier_ratio ≈ 0.25 →  cov_scale ≈ 0.038  (weak)
+            cov_scale = max(0.001, 0.05 * (1.0 - inlier_ratio))
+            cov = torch.eye(6, dtype=torch.float64) * cov_scale
+            cov[3:, 3:] *= 0.1   # rotation block tighter than translation
+
+            return LoopClosureResult(
+                query_kf_idx  = query_kf_idx,
+                match_kf_idx  = match_kf_idx,
+                relative_pose = T_rel,
+                covariance    = cov,
+                confidence    = inlier_ratio,
+            )
+
+        # ── Fallback: pose-based heuristic ──────────────────────────────
+        if similarity < self.lc_geometric_threshold:
             return None
 
         T_query = pp.SE3(
@@ -414,4 +490,5 @@ class MACSLAM(IOdometry[T_SensorFrame]):
         self.terminated = True
         Logger.write("info",
             f"MACSLAM: terminated — {self.total_lc_detected} loop closures "
-            f"detected across {self.frame_count} frames")
+            f"accepted, {self.total_lc_rejected} rejected, "
+            f"across {self.frame_count} frames")
