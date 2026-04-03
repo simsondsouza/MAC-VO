@@ -1,5 +1,5 @@
 type: KITTI
 name: K00
 args:
-    root: data/KITTI_odometry/dataset/sequences/00
+    root: /data/KITTI_odometry/dataset/sequences/00
     gt_pose: true

@@ -26,6 +26,7 @@ class GraphOutput:
     motion   : torch.Tensor
     from_idx : torch.Tensor
     frame_idx: torch.Tensor
+    hessian_inv: torch.Tensor | None = None   # ← ADD THIS
 
 
 ############## Optimization Graphs
@@ -70,7 +71,7 @@ class ICP_TwoframePGO(FactorGraph):
     @torch.no_grad()
     @torch.inference_mode()
     def write_back(self) -> GraphOutput:
-        return GraphOutput(motion=self.pose2opt, frame_idx=self.frame_idx, from_idx=self.from_idx)
+        return GraphOutput(motion=self.pose2opt, frame_idx=self.frame_idx, from_idx=self.from_idx, hessian_inv=getattr(self, '_cached_hessian_inv', None),)
 
 
 class Reproj_TwoFramePGO(FactorGraph):

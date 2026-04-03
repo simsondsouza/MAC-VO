@@ -41,3 +41,17 @@ MatchStore   = AutoScalingBundle[MatchingFeature]
 
 PointNode    = TensorBundle[PointFeature]
 PointStore   = AutoScalingBundle[PointFeature]
+
+
+# ── Loop Closure Edge Features  (MAC-SLAM) ──────────────────────────────
+LoopClosureFeature = T.Literal[
+    "relative_pose",   # Nx7   , dtype=float64, SE3 relative pose T_ab
+    "covariance",      # Nx6x6 , dtype=float64, marginalized covariance
+    "switch_var",      # Nx1   , dtype=float64, switchable constraint s_ab
+    "confidence",      # Nx1   , dtype=float32, VPR similarity score
+    "kf_idx_a",        # Nx1   , dtype=long,    keyframe index a
+    "kf_idx_b",        # Nx1   , dtype=long,    keyframe index b
+]
+
+LoopClosureNode  = TensorBundle[LoopClosureFeature]
+LoopClosureStore = AutoScalingBundle[LoopClosureFeature]

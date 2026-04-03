@@ -9,3 +9,4 @@ from .Optimization import IOptimizer
 from .Frontend.StereoDepth import IStereoDepth
 from .Frontend.Matching    import IMatcher
 from .Frontend.Frontend    import IFrontend
+from .LoopClosure          import ILoopClosureDetector

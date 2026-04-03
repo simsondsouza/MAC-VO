@@ -1,0 +1,130 @@
+#
+# MAC-SLAM configuration for KITTI sequence 00
+# Extends MAC-VO Performant mode with global loop closure
+#
+# Usage:
+#   python MACSLAM.py --odom Config/Experiment/MACSLAM/MACSLAM_KITTI.yaml \
+#                     --data Config/Sequence/KITTI_K00.yaml
+#
+Common:
+  device: &device cuda
+  max_depth: &max_depth auto
+
+Odometry:
+  name: MACSLAM_KITTI
+  args:
+    device: *device
+    edgewidth: 32
+    num_point: 200
+    match_cov_default: 0.25
+    profile: false
+    mapping: false
+
+  cov:
+    obs:
+      type: MatchCovariance
+      args:
+        device: *device
+        kernel_size: 31
+        match_cov_default: 0.25
+        min_depth_cov: 0.05
+        min_flow_cov: 0.25
+
+  keypoint:
+    type: CovAwareSelector
+    args:
+      device: *device
+      kernel_size: 7
+      mask_width: 32
+      max_depth: *max_depth
+      max_depth_cov: 250.0
+      max_match_cov: 100.0
+
+  mappoint:
+    type: MappingPointSelector
+    args:
+      device: *device
+      max_depth: 5.0
+      max_depth_cov: 0.005
+      mask_width: 32
+
+  frontend:
+    type: CUDAGraph_FlowFormerCovFrontend
+    args:
+      device: *device
+      weight: ./Model/MACVO_FrontendCov.pth
+      enc_dtype: fp32
+      dec_dtype: fp32
+      decoder_depth: 12
+      enforce_positive_disparity: false
+
+  motion:
+    type: TartanMotionNet
+    args:
+      weight: ./Model/MACVO_posenet.pkl
+      device: *device
+
+  outlier:
+    type: FilterCompose
+    args:
+      filter_args:
+        - type: CovarianceSanityFilter
+          args:
+        - type: SimpleDepthFilter
+          args:
+            min_depth: 0.05
+            max_depth: *max_depth
+        - type: LikelyFrontOfCamFilter
+          args:
+
+  postprocess:
+    type: MotionInterpolate
+    args:
+
+  keyframe:
+    type: AllKeyframe
+    args:
+
+  optimizer:
+    type: TwoFrame_PGO
+    args:
+      device: cpu
+      vectorize: true
+      parallel: true
+      graph_type: icp
+      autodiff: true
+
+# ──────────────────────────────────────────────────────────────────────
+# MAC-SLAM extensions
+# ──────────────────────────────────────────────────────────────────────
+SLAM:
+  # Place-recognition for loop closure candidate retrieval
+  loop_closure:
+    type: NetVLADLoopDetector
+    args:
+      device: *device
+      backbone: resnet18        # resnet18 | resnet34 | resnet50
+      descriptor_dim: 512
+      threshold: 0.92           # cosine similarity threshold
+      top_k: 3                  # max candidates per query
+      min_gap: 50               # frames; KITTI 00 loop ≈ 1500-frame gap
+
+  # Asynchronous global pose-graph optimiser
+  global_pgo:
+    lambda_switch: 1.0          # switchable constraint penalty
+    max_iterations: 50          # LM iterations per solve
+    huber_delta: 0.5
+    device: cpu                 # sparse graph → CPU is fine
+
+  # Orchestrator behaviour
+  lc_min_gap: 50                # must match loop_closure.args.min_gap
+  lc_geometric_threshold: 0.80  # accept LC above this similarity
+  keyframe_freq: 5              # encode every N-th frame for VPR
+  apply_correction: true        # propagate δT after global solve
+
+Preprocess:
+  - type: SmartResizeFrame
+    args:
+      height: 376
+      width: 780
+      interp: nearest

@@ -1,0 +1,5 @@
+type: KITTI
+name: K07
+args:
+    root: /data/KITTI_odometry/dataset/sequences/07
+    gt_pose: true

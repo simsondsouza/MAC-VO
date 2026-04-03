@@ -99,6 +99,21 @@ class TwoFrame_PGO(IOptimizer[GraphInput, dict, GraphOutput]):
                 loss = optimizer.step(input=(), weight=weight)
                 scheduler.step(loss)
 
+            try:
+                with torch.no_grad():
+                    J = pp.optim.functional.modjac(graph, input=(), flatten=False, vectorize=True)
+                    params = dict(graph.named_parameters())
+                    J = torch.cat([j.reshape(-1, p.numel())
+                                for j, p in zip(J, params.values())], 1)
+                    W = torch.block_diag(*(
+                        torch.pinverse(graph.covariance_array()
+                                    .to(context["device"]).double())))
+                    H = J.T @ W @ J
+                    H_inv = torch.linalg.inv(H[:6, :6])   # marginalize to se(3)
+                    graph._cached_hessian_inv = H_inv
+            except Exception:
+                graph._cached_hessian_inv = None
+
         return context, graph.write_back()
 
     def write_graph_data(self, result: GraphOutput | None, global_map: VisualMap) -> None:
@@ -158,4 +173,5 @@ class Empty_TwoFrame_PGO(TwoFrame_PGO):
     def _optimize(context: dict, graph_data: GraphInput) -> tuple[dict, GraphOutput]:
         return context, GraphOutput(motion=graph_data.init_motion,
                                     frame_idx=graph_data.frame_idx,
-                                    from_idx=graph_data.from_idx)
+                                    from_idx=graph_data.from_idx
+)
