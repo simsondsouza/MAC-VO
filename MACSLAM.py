@@ -155,6 +155,7 @@ if __name__ == "__main__":
             .clip(args.seq_from, args.seq_to),
         cfg.Preprocess,
     )
+    
     if args.preload:
         sequence = sequence.preload()
 
