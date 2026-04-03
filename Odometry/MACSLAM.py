@@ -249,7 +249,7 @@ class MACSLAM(IOdometry[T_SensorFrame]):
     # Loop-closure pipeline
     # ==================================================================
 
-    def _check_loop_closure(self, kf_idx: int, frame: T_SensorFrame) -> None:
+    def _check_loop_closure(self, kf_idx: int, frame: T_SensorFrame) -> bool | None:
         """
         1. Encode the keyframe and add to VPR database.
         2. Query for candidates (cosine similarity).
@@ -300,6 +300,8 @@ class MACSLAM(IOdometry[T_SensorFrame]):
         # 5. Trigger global solve
         if any_accepted and not self.global_pgo.is_running:
             self.global_pgo.trigger_optimization()
+            return True # Tell the caller we started an optimization
+        return False
 
     def _geometric_verify(
         self,
@@ -394,7 +396,7 @@ class MACSLAM(IOdometry[T_SensorFrame]):
     # Correction propagation
     # ==================================================================
 
-    def _apply_global_correction(self) -> None:
+    def _apply_global_correction(self, block: bool = False) -> None:
         """
         Poll the global PGO for a finished solve and propagate δT.
 
@@ -405,7 +407,9 @@ class MACSLAM(IOdometry[T_SensorFrame]):
         if not self.apply_correction:
             return
 
-        correction = self.global_pgo.get_correction()
+        correction = self.global_pgo.get_correction(block=block)
+
+        Logger.write("info", f"MACSLAM: global correction available {correction}")
         if correction is None:
             return
 
@@ -473,12 +477,14 @@ class MACSLAM(IOdometry[T_SensorFrame]):
             (self.frame_count % self.keyframe_freq == 0)
             or self.frame_count <= 1
         )
+        triggered_lc = False
         if is_global_kf and curr_kf_idx >= 0:
             self.global_kf_indices.append(curr_kf_idx)
-            self._check_loop_closure(curr_kf_idx, frame)
+            # Capture whether we triggered a global solve
+            triggered_lc = self._check_loop_closure(curr_kf_idx, frame)
 
         # Step 3
-        self._apply_global_correction()
+        self._apply_global_correction(block=triggered_lc)
 
     def get_map(self) -> VisualMap:
         return self.local_vo.get_map()

@@ -51,6 +51,7 @@ from pypose.optim.kernel import Huber
 from pypose.optim.scheduler import StopOnPlateau
 from pypose.optim.solver import PINV
 from pypose.optim.strategy import TrustRegion
+from pypose.optim.solver import Cholesky
 
 from Utility.PrettyPrint import Logger
 from Utility.Math import NormalizeQuat
@@ -236,10 +237,16 @@ class GlobalPGO_Optimizer:
         self._opt_thread.start()
         Logger.write("info", "GlobalPGO: background solve triggered")
 
-    def get_correction(self) -> Optional[CorrectionResult]:
-        """Non-blocking.  Returns the correction if available, else None."""
+    def get_correction(self, block: bool = False) -> Optional[CorrectionResult]:
+        """Returns the correction. If block=True, waits for the solver to finish."""
+        # Block the main thread if requested and the solver is running
+        if block and self._is_running and self._opt_thread is not None:
+            Logger.write("info", "GlobalPGO: Blocking main thread to wait for global solve...")
+            self._opt_thread.join()
+
         if self._is_running:
             return None
+        
         result = self._correction
         self._correction = None
         return result
@@ -330,13 +337,16 @@ class GlobalPGO_Optimizer:
         # ── 6.  Build factor graph & LM optimiser ──────────────────────
         graph = GlobalPoseGraph(graph_input).to(dtype=torch.float64)
 
+        
+
         optimizer = LM(
             graph,
-            solver    = PINV(),
+            solver    = Cholesky(),
             strategy  = TrustRegion(radius=1e3),
             kernel    = Huber(delta=self.huber_delta),
             corrector = FastTriggs(Huber(delta=self.huber_delta)),
             min       = 1e-6,
+            vectorize = True, 
         )
         scheduler = StopOnPlateau(
             optimizer,
