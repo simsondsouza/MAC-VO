@@ -158,6 +158,7 @@ if __name__ == "__main__":
     if args.preload:
         sequence = sequence.preload()
 
+
     # ── Build & run ─────────────────────────────────────────────────────
     system = MACSLAM[StereoFrame].from_config(asNamespace(exp_space.config))
     system.receive_frames(
