@@ -1,4 +1,4 @@
-type: KITTI
+type: KITTI_IMU
 name: K07
 args:
     root: data/KITTI_odometry/dataset/sequences/07

@@ -1,0 +1,99 @@
+#
+# MAC-VO Fast + IMU  –  Fast-mode frontend with sliding-window PVGO
+# Based on MACVO_Fast.yaml; adds IMU preintegration and PVGO settings.
+# Used with MACVO_IMU.py entry point and KITTI_IMU sequences.
+#
+# Differences from MACVO_Fast.yaml:
+#   - Odometry.name: MACVO-Fast-IMU
+#   - Added IMU / PVGO settings (window_size, lambdas, lm_steps, gravity)
+#   - frontend uses fp16/bf16 mixed precision (same as Fast)
+#   - keypoint selector: CovAwareSelector_NoDepth (same as Fast)
+#   - mapping: false (not needed for odometry evaluation)
+#
+
+Common:
+  device: &device cuda
+
+Odometry:
+  name: MACVO-Fast-IMU
+  args:
+    device: *device
+    edgewidth: 32
+    num_point: 200
+    match_cov_default: 0.25
+    profile: false
+    mapping: false
+
+    # ── IMU / PVGO settings ───────────────────────────────────────────────
+    window_size:   15     # larger window gives IMU more temporal context
+    lambda_macvo:  5.0    # visual strongly dominates
+    lambda_rot:    0.5    # keep — rotation residual improved ROE
+    lambda_cross:  0.01   # reduced from 0.1 — IMU position is noisy
+    lambda_deltav: 0.01   # reduced from 0.1 — IMU velocity is noisy
+    lambda_bias:   10.0   # keep — bias regularisation
+    lm_steps:      20
+    gravity:       9.81   # [m s⁻²]
+
+  cov:
+    obs:
+      type: MatchCovariance
+      args:
+        device: *device
+        kernel_size: 31
+        match_cov_default: 0.25
+        min_depth_cov: 0.05
+        min_flow_cov: 0.25
+
+  keypoint:
+    type: CovAwareSelector_NoDepth
+    args:
+      device: *device
+      kernel_size: 7
+      mask_width: 32
+      max_match_cov: 100.0
+
+  mappoint:
+    type: MappingPointSelector
+    args:
+      device: *device
+      max_depth: 5.0
+      max_depth_cov: 0.005
+      mask_width: 32
+
+  frontend:
+    type: CUDAGraph_FlowFormerCovFrontend
+    args:
+      device: *device
+      weight: ./Model/MACVO_FrontendCov.pth
+      enc_dtype: fp16
+      dec_dtype: bf16
+      decoder_depth: 12
+      enforce_positive_disparity: false
+
+  motion:
+    type: StaticMotionModel
+    args:
+
+  outlier:
+    type: CovarianceSanityFilter
+    args:
+
+  postprocess:
+    type: MotionInterpolate
+    args:
+
+  keyframe:
+    type: AllKeyframe
+    args:
+
+  optimizer:
+    type: TwoFrame_PGO
+    args:
+      device: cpu
+      vectorize: true
+      parallel: true
+      graph_type: disp
+      autodiff: false
+
+Data: !include ../../Sequence/KITTI_K07_IMU.yaml
+Preprocess: !include ../Common/Preprocess.yaml

@@ -1,0 +1,145 @@
+#
+# MAC-SLAM + IMU + Loop Closure
+# ==============================
+# Combines MACVO_Fast_IMU (visual odometry + sliding-window PVGO with IMU)
+# with MixVPR loop closure and asynchronous global PGO.
+#
+# Based on:
+#   Config/Experiment/MACSLAM/MACSLAM_MixVPR2.yaml  (SLAM / loop-closure settings)
+#   Config/Experiment/MACVO/MACVO_Fast_IMU.yaml     (IMU / PVGO settings)
+#
+# Entry point: MACSLAM_IMU_LC.py
+#
+# Usage:
+#   python MACSLAM_IMU_LC.py \
+#       --odom Config/Experiment/MACSLAM/MACSLAM_IMU_LC.yaml \
+#       --data Config/Sequence/KITTI_K07_IMU.yaml
+#
+
+Common:
+  device: &device cuda
+
+Odometry:
+  name: MACSLAM-IMU-LC
+  args:
+    device: *device
+    edgewidth: 32
+    num_point: 200
+    match_cov_default: 0.25
+    profile: false
+    mapping: true
+
+    # ── IMU / PVGO settings ───────────────────────────────────────────────
+    window_size:   15
+    lambda_macvo:  5.0
+    lambda_rot:    0.5
+    lambda_cross:  0.01
+    lambda_deltav: 0.01
+    lambda_bias:   10.0
+    lm_steps:      20
+    gravity:       9.81
+
+  cov:
+    obs:
+      type: MatchCovariance
+      args:
+        device: *device
+        kernel_size: 31
+        match_cov_default: 0.25
+        min_depth_cov: 0.05
+        min_flow_cov: 0.25
+
+  keypoint:
+    type: CovAwareSelector_NoDepth
+    args:
+      device: *device
+      kernel_size: 7
+      mask_width: 32
+      max_match_cov: 100.0
+
+  mappoint:
+    type: MappingPointSelector
+    args:
+      device: *device
+      max_depth: 5.0
+      max_depth_cov: 0.005
+      mask_width: 32
+
+  frontend:
+    type: CUDAGraph_FlowFormerCovFrontend
+    args:
+      device: *device
+      weight: ./Model/MACVO_FrontendCov.pth
+      enc_dtype: fp16
+      dec_dtype: bf16
+      decoder_depth: 12
+      enforce_positive_disparity: false
+
+  motion:
+    type: StaticMotionModel
+    args:
+
+  outlier:
+    type: CovarianceSanityFilter
+    args:
+
+  postprocess:
+    type: MotionInterpolate
+    args:
+
+  keyframe:
+    type: AllKeyframe
+    args:
+
+  optimizer:
+    type: TwoFrame_PGO
+    args:
+      device: cpu
+      vectorize: true
+      parallel: true
+      graph_type: disp
+      autodiff: false
+
+Data: !include ../../Sequence/KITTI_K07_IMU.yaml
+
+Preprocess:
+  - type: SmartResizeFrame
+    args:
+      height: 376
+      width: 780
+      interp: nearest
+
+# ──────────────────────────────────────────────────────────────────────
+# MAC-SLAM extensions
+# ──────────────────────────────────────────────────────────────────────
+SLAM:
+  loop_closure:
+    type: MixVPRLoopDetector
+    args:
+      device: *device
+      threshold: 0.5
+      top_k: 3
+      min_gap: 80
+      orb_features: 1000
+      match_ratio: 0.75
+      ransac_threshold: 1.0
+      geometric_min_inliers: 30
+      geometric_min_inlier_ratio: 0.25
+
+  global_pgo:
+    lambda_switch: 1.0
+    max_iterations: 50
+    huber_delta: 0.5
+    device: cpu
+
+  lc_min_gap: 80
+  lc_geometric_threshold: 0.25
+  keyframe_freq: 5
+  apply_correction: true
+
+Preprocess:
+  - type: SmartResizeFrame
+    args:
+      height: 376
+      width: 780
+      interp: nearest

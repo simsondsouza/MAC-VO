@@ -119,9 +119,22 @@ class MACSLAM(IOdometry[T_SensorFrame]):
         self.total_lc_detected: int = 0
         self.total_lc_rejected: int = 0  # geometric verification failures
 
+        # Two-tier correction storage.
+        # Maps frame_idx → absolute (7,) SE3 tensor that is the final
+        # LC-corrected pose computed using the PVGO pose as base.
+        # Written by _apply_global_correction(); read by get_map().
+        self._lc_optimized_poses: dict[int, torch.Tensor] = {}
+
         # Install a hook so that after every local optimisation write-back
         # we automatically push the sequential edge to the global graph.
         self.local_vo.register_on_optimize_finish(self._on_local_optimize_done)
+
+        # If local_vo is MACVO_IMU (or similar), register a PVGO-commit hook.
+        # This ensures Tier-2 (LC global PGO) uses Tier-1 (PVGO) absolute poses
+        # as its node estimates, so the two tiers build on each other rather than
+        # fighting over the same raw visual poses.
+        if hasattr(local_vo, "register_on_pvgo_commit"):
+            local_vo.register_on_pvgo_commit(self._on_pvgo_commit)
 
     # ==================================================================
     # Factory
@@ -203,6 +216,20 @@ class MACSLAM(IOdometry[T_SensorFrame]):
             keyframe_freq          = getattr(slam_cfg, "keyframe_freq", 5),
             apply_correction       = getattr(slam_cfg, "apply_correction", True),
         )
+
+    # ==================================================================
+    # Hook:  PVGO commit  (Tier-1 → Tier-2 feed)
+    # ==================================================================
+
+    def _on_pvgo_commit(self, fidx: int, pvgo_se3: "pp.LieTensor") -> None:
+        """
+        Called by MACVO_IMU after a successful PVGO commit for frame ``fidx``.
+
+        Updates the global PGO node so that Tier-2 (loop-closure PGO) uses
+        the PVGO-corrected absolute pose as its sequential-edge anchor,
+        not the raw visual pose.  This is the Tier-1 → Tier-2 hand-off.
+        """
+        self.global_pgo.update_keyframe_pose(fidx, pvgo_se3)
 
     # ==================================================================
     # Hook:  local MAC-VO optimisation finished
@@ -400,9 +427,23 @@ class MACSLAM(IOdometry[T_SensorFrame]):
         """
         Poll the global PGO for a finished solve and propagate δT.
 
-        For each keyframe  k:   T_k ← δT_k · T_k
+        Two-tier ordering
+        -----------------
+        For each keyframe k, the base pose is the **PVGO-corrected** pose
+        (from ``local_vo._pvgo_trajectory``) when available, falling back to
+        the current visual pose.  This ensures LC corrections build on top of
+        IMU/PVGO output, not on top of raw visual poses.
+
+        The resulting absolute poses  ``δT_k · T_pvgo_k``  are stored in
+        ``_lc_optimized_poses`` and also written to ``graph`` so the motion
+        model benefits from corrections during live tracking.
+
+        ``get_map()`` calls ``local_vo.get_map()`` first (which writes PVGO
+        absolute poses), then overlays ``_lc_optimized_poses`` to produce
+        the final two-tier trajectory.
+
         For non-keyframes between two corrected KFs: apply δT of the
-        nearest *preceding* keyframe  (rigid correction).
+        nearest *preceding* keyframe (rigid correction).
         """
         if not self.apply_correction:
             return
@@ -413,22 +454,30 @@ class MACSLAM(IOdometry[T_SensorFrame]):
         if correction is None:
             return
 
-        graph    = self.local_vo.graph
-        n_frames = len(graph.frames)
+        graph     = self.local_vo.graph
+        n_frames  = len(graph.frames)
+        pvgo_traj = getattr(self.local_vo, "_pvgo_trajectory", {})
 
         Logger.write("info",
-            f"MACSLAM: applying δT to {len(correction.kf_corrections)} KFs")
+            f"MACSLAM: applying δT to {len(correction.kf_corrections)} KFs "
+            f"({len(pvgo_traj)} frames have PVGO corrections)")
 
-        # 1. Apply to keyframes
+        # 1. Apply to keyframes using PVGO pose as base when available.
         for kf_idx, delta_T in correction.kf_corrections.items():
             if kf_idx >= n_frames:
                 continue
-            old = pp.SE3(graph.frames.data["pose"][kf_idx].unsqueeze(0).double())
-            new = delta_T.double() @ old
-            graph.frames.data["pose"][kf_idx] = \
-                NormalizeQuat(new).float().squeeze(0)
+            if kf_idx in pvgo_traj:
+                base = pp.SE3(pvgo_traj[kf_idx].unsqueeze(0).double())
+            else:
+                base = pp.SE3(graph.frames.data["pose"][kf_idx].unsqueeze(0).double())
+            optimized = delta_T.double() @ base
+            optimized_t = NormalizeQuat(optimized).float().squeeze(0)
+            # Store absolute LC-optimized pose for correct ordering in get_map()
+            self._lc_optimized_poses[kf_idx] = optimized_t
+            # Also write to graph so motion model benefits during live tracking
+            graph.frames.data["pose"][kf_idx] = optimized_t
 
-        # 2. Propagate to non-keyframes
+        # 2. Propagate to non-keyframes using PVGO pose as base.
         sorted_kfs = sorted(correction.kf_corrections.keys())
         for i in range(n_frames):
             if i in correction.kf_corrections:
@@ -441,12 +490,15 @@ class MACSLAM(IOdometry[T_SensorFrame]):
                 else:
                     break
             if nearest is not None:
-                dT  = correction.kf_corrections[nearest]
-                old = pp.SE3(
-                    graph.frames.data["pose"][i].unsqueeze(0).double())
-                new = dT.double() @ old
-                graph.frames.data["pose"][i] = \
-                    NormalizeQuat(new).float().squeeze(0)
+                dT = correction.kf_corrections[nearest]
+                if i in pvgo_traj:
+                    base = pp.SE3(pvgo_traj[i].unsqueeze(0).double())
+                else:
+                    base = pp.SE3(graph.frames.data["pose"][i].unsqueeze(0).double())
+                optimized = dT.double() @ base
+                optimized_t = NormalizeQuat(optimized).float().squeeze(0)
+                self._lc_optimized_poses[i] = optimized_t
+                graph.frames.data["pose"][i] = optimized_t
 
         Logger.write("info", "MACSLAM: corrections applied")
 
@@ -487,7 +539,25 @@ class MACSLAM(IOdometry[T_SensorFrame]):
         self._apply_global_correction(block=triggered_lc)
 
     def get_map(self) -> VisualMap:
-        return self.local_vo.get_map()
+        # Step 1 — apply Tier-1 (PVGO) corrections.
+        # For MACVO_IMU this writes absolute PVGO poses to graph.frames.data["pose"],
+        # overwriting whatever live-tracking had in the graph (including any LC
+        # corrections that were applied during tracking for motion-model benefit).
+        graph = self.local_vo.get_map()
+
+        # Step 2 — apply Tier-2 (LC) corrections on top of PVGO poses.
+        # _lc_optimized_poses[fidx] = δT_lc · T_pvgo   (absolute, pre-computed
+        # by _apply_global_correction using PVGO as base), so writing them here
+        # gives the correct two-tier ordering:
+        #   final = LC_correction( PVGO_correction( visual_pose ) )
+        if self._lc_optimized_poses:
+            device   = graph.frames.data["pose"].tensor.device
+            n_frames = len(graph.frames)
+            for fidx, lc_pose in self._lc_optimized_poses.items():
+                if fidx < n_frames:
+                    graph.frames.data["pose"][fidx] = lc_pose.to(device)
+
+        return graph
 
     def terminate(self) -> None:
         self.global_pgo.terminate()

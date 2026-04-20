@@ -390,6 +390,32 @@ class MixVPRLoopDetector(ILoopClosureDetector):
             # Official checkpoints wrap in "state_dict" (Lightning convention)
             sd = ckpt.get("state_dict", ckpt)
 
+            # Remap backbone keys: official checkpoint uses "backbone.model.X.*"
+            # but our VPRModel flattens the ResNet as an nn.Sequential named
+            # "encoder" with integer indices:
+            #   backbone.model.conv1.*  → encoder.0.*
+            #   backbone.model.bn1.*   → encoder.1.*
+            #   backbone.model.layer1.*→ encoder.4.*
+            #   backbone.model.layer2.*→ encoder.5.*
+            #   backbone.model.layer3.*→ encoder.6.*
+            # aggregator.* keys already match — no remapping needed.
+            _backbone_remap = {
+                "backbone.model.conv1.":  "encoder.0.",
+                "backbone.model.bn1.":    "encoder.1.",
+                "backbone.model.layer1.": "encoder.4.",
+                "backbone.model.layer2.": "encoder.5.",
+                "backbone.model.layer3.": "encoder.6.",
+            }
+            remapped_sd = {}
+            for k, v in sd.items():
+                new_k = k
+                for old_prefix, new_prefix in _backbone_remap.items():
+                    if k.startswith(old_prefix):
+                        new_k = new_prefix + k[len(old_prefix):]
+                        break
+                remapped_sd[new_k] = v
+            sd = remapped_sd
+
             # Load and report
             result = self.model.load_state_dict(sd, strict=False)
 
@@ -399,11 +425,11 @@ class MixVPRLoopDetector(ILoopClosureDetector):
                 f"MixVPR: loaded {n_loaded}/{n_model} parameters from {p}")
 
             if result.missing_keys:
-                Logger.write("debug",
-                    f"MixVPR: missing keys: {result.missing_keys[:5]}...")
+                Logger.write("warn",
+                    f"MixVPR: missing keys ({len(result.missing_keys)} total): {result.missing_keys[:5]}...")
             if result.unexpected_keys:
-                Logger.write("debug",
-                    f"MixVPR: unexpected keys: {result.unexpected_keys[:5]}...")
+                Logger.write("warn",
+                    f"MixVPR: unexpected keys ({len(result.unexpected_keys)} total): {result.unexpected_keys[:5]}...")
 
         except Exception as e:
             Logger.write("warn", f"MixVPR: failed to load {p}: {e}")
